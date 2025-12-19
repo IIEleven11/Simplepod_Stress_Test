@@ -32,8 +32,8 @@ Simple python script that will stress test whatever GPU you have installed. It w
 - `--monitor-interval`: Interval the log should update metrics at. Default is two seconds..
 
 ### Example
-Run a stress test for 120 seconds and log GPU stats every 10 seconds:
+Run a stress test for 5 seconds and log GPU stats every 1 second:
 ```bash
-python gpu_stress_test.py --duration 120 --monitor-interval 10
+python python3 gpu_stress_test.py --duration 5 --monitor-interval 1
 ```
 
