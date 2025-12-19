@@ -10,6 +10,18 @@ Simple python script that will stress test whatever GPU you have installed. It w
     ```bash
     cd Simplepod_Stress_Test
     ```
+3. **Install Dependencies**:
+    Make sure you have Python and pip installed. Then run:
+    
+    Install UV: ``` curl -LsSf https://astral.sh/uv/install.sh | sh ```
+    
+    Create venv: ``` uv venv --python 3.12 ```
+
+    Activate venv: ``` source .venv/bin/activate ```
+    
+    Install torch: ``` uv pip install torch torchaudio torchvision --index-url https://download.pytorch.org/whl/cu129 ```
+    
+
 3. **Run the Stress Test**:
     ```bash
     python gpu_stress_test.py --duration <integer>  --monitor-interval <integer>

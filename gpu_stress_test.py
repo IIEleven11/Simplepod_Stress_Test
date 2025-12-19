@@ -5,8 +5,26 @@ import threading
 import sys
 import subprocess
 import shutil
+import signal
+import os
 
+# Global flag to control monitoring thread
 stop_monitoring = False
+
+def signal_handler(signum, frame):
+    """
+    Handle signals like SIGTSTP (Ctrl+Z) to prevent suspension and ensure clean exit.
+    """
+    print("\n\nReceived signal (Ctrl+C or Ctrl+Z). Exiting cleanly...")
+    global stop_monitoring
+    stop_monitoring = True
+    # Force exit to ensure threads are killed
+    os._exit(0)
+
+# Register signal handlers
+signal.signal(signal.SIGINT, signal_handler)
+if hasattr(signal, 'SIGTSTP'):
+    signal.signal(signal.SIGTSTP, signal_handler)
 
 def get_gpu_metrics():
     """
@@ -76,41 +94,90 @@ def stress_gpu(gpu_id, duration, target_vram_gb=None):
         print(f"GPU {gpu_id}: {props.name}")
         print(f"GPU {gpu_id}: Total Memory: {total_memory / 1024**3:.2f} GB")
 
+        # Check if VRAM is already heavily used (e.g. by a suspended process)
+        # We check nvidia-smi metrics because torch.cuda.mem_get_info might report free memory 
+        # that is technically "free" but practically unusable if another process is holding it in a weird state.
+        metrics = get_gpu_metrics()
+        current_usage_mb = 0
+        if metrics:
+            for m in metrics:
+                if str(m['index']) == str(gpu_id):
+                    current_usage_mb = m['mem_used']
+                    break
+        
+        print(f"GPU {gpu_id}: Current VRAM usage: {current_usage_mb} MB")
+        
+        # If more than 20% of memory is used, we assume it's dirty and skip filler to ensure compute runs
+        total_mem_mb = total_memory / 1024**2
+        skip_filler = False
+        if current_usage_mb > (total_mem_mb * 0.2):
+            print(f"GPU {gpu_id}: WARNING - High memory usage detected! Skipping filler allocation to ensure compute runs.")
+            skip_filler = True
+
+        # Get actual free memory reported by driver
+        free_memory, total_memory_info = torch.cuda.mem_get_info(device)
+        print(f"GPU {gpu_id}: Driver reports Free Memory: {free_memory / 1024**3:.2f} GB")
+
         # Calculate how much memory to allocate
-        reserved = 1 * 1024**3 
-        alloc_memory = total_memory - reserved
+        # We want to leave enough space for the compute loop and system overhead.
+        # 16k x 16k float32 matrix is 1GB. We need 3 of them (A, B, C) = 3GB.
+        # Plus some overhead. Let's leave 5GB free.
+        compute_reserve = 5 * 1024**3 
+        
+        alloc_memory = free_memory - compute_reserve
         
         if target_vram_gb:
-             alloc_memory = min(alloc_memory, int(target_vram_gb * 1024**3))
+             # If target is specified, we try to hit that target, but capped by available free memory
+             target_bytes = int(target_vram_gb * 1024**3)
+             if target_bytes < alloc_memory:
+                 alloc_memory = target_bytes
 
-        print(f"GPU {gpu_id}: Attempting to allocate {alloc_memory / 1024**3:.2f} GB")
-
-        compute_buffer_size = 2 * 1024**3
-        filler_size = alloc_memory - compute_buffer_size
-        
-        if filler_size > 0:
-            num_elements = filler_size // 4
+        if not skip_filler and alloc_memory > 0:
+            print(f"GPU {gpu_id}: Attempting to allocate {alloc_memory / 1024**3:.2f} GB filler...")
+            num_elements = alloc_memory // 4
             try:
+                # Use empty first, then fill
                 filler = torch.empty(num_elements, dtype=torch.float32, device=device)
-                filler.normal_()
-                print(f"GPU {gpu_id}: Allocated {filler_size / 1024**3:.2f} GB filler tensor")
+                # Fill with a value to force physical allocation
+                filler.fill_(1.0) 
+                print(f"GPU {gpu_id}: Successfully allocated and filled filler tensor.")
             except RuntimeError as e:
-                print(f"GPU {gpu_id}: Failed to allocate filler: {e}")
-                return
+                # print(f"GPU {gpu_id}: Failed to allocate filler: {e}")
+                print(f"GPU {gpu_id}: Could not allocate extra filler (VRAM might already be full). Proceeding to compute...")
+                # If filler fails, we proceed to compute anyway, just with less VRAM usage
+        else:
+            if skip_filler:
+                print(f"GPU {gpu_id}: Skipped filler due to high existing usage.")
+            else:
+                print(f"GPU {gpu_id}: Not enough free memory for filler, proceeding to compute only.")
 
-        N = 8192 
+        # Compute tensors
+        # 16384x16384 float32 is 1GB.
+        N = 16384 
         print(f"GPU {gpu_id}: Starting compute loop with matrix size {N}x{N}")
         
-        a = torch.randn(N, N, device=device, dtype=torch.float32)
-        b = torch.randn(N, N, device=device, dtype=torch.float32)
+        try:
+            a = torch.randn(N, N, device=device, dtype=torch.float32)
+            b = torch.randn(N, N, device=device, dtype=torch.float32)
+        except RuntimeError as e:
+             print(f"GPU {gpu_id}: Failed to allocate compute tensors: {e}")
+             return
         
         start_time = time.time()
         
+        print(f"GPU {gpu_id}: Running stress test...")
         while True:
             if duration > 0 and (time.time() - start_time) > duration:
                 break
             
+            # Perform matrix multiplication
             c = torch.mm(a, b)
+            
+            # Add a dependency to prevent optimization and keep memory bus active
+            a.add_(c, alpha=0.0001)
+            
+            # Synchronize to ensure the GPU is actually finishing the work
+            torch.cuda.synchronize()
 
     except Exception as e:
         print(f"GPU {gpu_id}: Error occurred: {e}")
